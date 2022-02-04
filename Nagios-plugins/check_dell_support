@@ -1,0 +1,113 @@
+#!/bin/bash
+# Onno Zweers, 2011-10-04
+#
+# WARNING: Dell has hidden their support info behind a captcha, breaking this Nagios plugin.
+#
+# Description:
+#
+# This plugin checks how many days a Dell host is supported.
+#
+# Changes:
+# 2012-03-12 - Onno - Caching, changed URL
+# 2013-11-10 - Onno - Caching changed from 31 days to 10 years :-)
+# 2013-12-19 - Onno - URL changed again (why?)
+
+# Nagios return codes
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+STATE_DEPENDENT=4
+
+CHECK_NAME="DELL SUPPORT"
+
+PROGNAME=`basename $0`
+
+DELL_SUPPORT_URL="http://www.dell.com/support/my-support/us/en/19/product-support/servicetag/"
+CACHEDIR="/var/cache/dell_support_info"
+mkdir --parents "$CACHEDIR"
+CACHE_DAYS=3650
+
+# Check some commands that we need
+/usr/bin/which dmidecode 2>&1 1>/dev/null || exit $STATE_UNKNOWN
+/usr/bin/which wget      2>&1 1>/dev/null || exit $STATE_UNKNOWN
+/usr/bin/which perl      2>&1 1>/dev/null || exit $STATE_UNKNOWN
+
+
+# Set defaults
+WARNING_DAYS=30
+CRITICAL_DAYS=0
+
+# Collect arguments
+while getopts w:c:s: OPT $@; do
+  case $OPT in
+    w) # warning if less then n days
+      WARNING_DAYS=$OPTARG
+      ;;
+    c) # critical if less than n days
+      CRITICAL_DAYS=$OPTARG
+      ;;
+    s) # specify serial number manually (if not, it's automatic)
+      POWEREDGE_SERIAL_NUMBERS="$OPTARG"
+      ;;
+  esac
+done
+
+WARNING_DATE=`date --date="$WARNING_DAYS days ago" +%Y%d%m`
+if [ "$CRITICAL_DAYS" = "0" ] ; then
+  # 0 means: no critical, only warning.
+  CRITICAL_DATE=`date --date="20 years ago" +%Y%d%m`
+else
+  CRITICAL_DATE=`date --date="$CRITICAL_DAYS days ago" +%Y%d%m`
+fi
+
+if [ -z "$POWEREDGE_SERIAL_NUMBERS" ] ; then
+  # This host can have several serial numbers (blade & chassis)
+  POWEREDGE_SERIAL_NUMBERS=`dmidecode | grep -2 PowerEdge | grep Serial | sed -e 's/.*Serial Number: //'`
+  if [ -z "$POWEREDGE_SERIAL_NUMBERS" ] ; then
+    echo "$CHECK_NAME UNKNOWN - Unable to get serial number with dmidecode. Am I running as root? Fix me or try specifying it with -s."
+    exit $STATE_UNKNOWN
+  fi
+fi
+
+ADDITIONAL_INFO="Checked serial numbers:"
+for SERIAL in $POWEREDGE_SERIAL_NUMBERS ; do
+  ADDITIONAL_INFO="$ADDITIONAL_INFO <a href='$DELL_SUPPORT_URL$SERIAL'>$SERIAL</a>"
+done
+
+for SERIAL in $POWEREDGE_SERIAL_NUMBERS ; do
+  # This part is tricky. Dell tends to change the URL from time to time.
+  WARRANTY_LINES=`wget --tries 3 --quiet --output-document=- "http://www.dell.com/support/my-support/us/en/19/product-support/servicetag/$SERIAL" \
+                  | grep -A 3 '<div class="span4 dateStyle" style="padding-left: 20px">.*upport.*</div>' \
+                  | grep -o '[0-9]\+/[0-9]\+/[0-9]\+' `
+  if [ -z "$WARRANTY_LINES" ] ; then
+    # Perhaps website down. Do we have a recent cached version?
+    if find "$CACHEDIR" -type f -name "$SERIAL" -mtime -$CACHE_DAYS | grep --silent . ; then
+      WARRANTY_LINES=`cat "$CACHEDIR/$SERIAL"`
+      CACHE_REMARK=" - Web page unavailable; using cached information."
+    else
+      echo "$CHECK_NAME UNKNOWN - Unable to get support information and cached info has expired. Check $DELL_SUPPORT_URL$SERIAL"
+      exit $STATE_UNKNOWN
+    fi
+  else
+    # Page collected succesfully; save in cache.
+    echo "$WARRANTY_LINES" > "$CACHEDIR/$SERIAL"
+  fi
+  # The sed converts date from m/d/yyyy to yyyymmdd.
+  END_DATE=`echo "$WARRANTY_LINES" | grep -o '[0-9/]\+' \
+            | sed -e 's/\b[0-9]\b/0&/g ; s#\([0-9]\+\)/\([0-9]\+\)/\([0-9]\+\)#\3\1\2#' \
+            | sort -n | tail -n 1`
+  END_DATE_READABLE=`echo $END_DATE | sed -e 's/\(....\)\(..\)\(..\)/\1-\2-\3/'`
+  # Determine status
+  if [ $END_DATE -lt $CRITICAL_DATE ] ; then
+    echo "$CHECK_NAME CRITICAL - support for <a href='$DELL_SUPPORT_URL$SERIAL'>$SERIAL</a> expires $END_DATE_READABLE. - $WARRANTY_INFO $CACHE_REMARK"
+    exit $STATE_CRITICAL
+  fi
+  if [ $END_DATE -lt $WARNING_DATE ] ; then
+    echo "$CHECK_NAME WARNING - support for <a href='$DELL_SUPPORT_URL$SERIAL'>$SERIAL</a> expires $END_DATE_READABLE. - $ADDITIONAL_INFO $CACHE_REMARK"
+    exit $STATE_WARNING
+  fi
+done
+
+echo "$CHECK_NAME OK - support for <a href='$DELL_SUPPORT_URL$SERIAL'>$SERIAL</a> expires $END_DATE_READABLE. - $ADDITIONAL_INFO $CACHE_REMARK"
+exit $STATE_OK
